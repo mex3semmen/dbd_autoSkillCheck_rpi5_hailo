@@ -1,5 +1,9 @@
 {
   "hitdelay": 59,
+  "delays": {
+    "wiggle_9": 10,
+    "fullblack_7": 25
+  },
   "hyperfocus": {
     "enabled": true,
     "slot": 2,

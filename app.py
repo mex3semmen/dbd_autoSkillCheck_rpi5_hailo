@@ -49,6 +49,7 @@ MODELS_FOLDER = "models"
 SETTINGS_FILE = "settings.json"
 DEFAULT_SETTINGS = {
     "hitdelay": 80,
+    "delays": { "wiggle_9": 10, "fullblack_7": 10 },  # NEU: klassenspezifische Delays
     "hyperfocus": {
         "enabled": True, "slot": 2, "use_full_frame_for_ocr": False,
         "rois": {
@@ -67,6 +68,10 @@ def load_settings():
             with open(SETTINGS_FILE, "r") as f:
                 j = json.load(f)
             if "hitdelay" in j: s["hitdelay"] = int(j["hitdelay"])
+            if "delays" in j and isinstance(j["delays"], dict):
+                dj = j["delays"]
+                if "wiggle_9" in dj:    s["delays"]["wiggle_9"] = int(dj["wiggle_9"])
+                if "fullblack_7" in dj: s["delays"]["fullblack_7"] = int(dj["fullblack_7"])
             if "hyperfocus" in j and isinstance(j["hyperfocus"], dict):
                 hf = s["hyperfocus"]; jhf = j["hyperfocus"]
                 for k in ("enabled","slot","use_full_frame_for_ocr","rois"):
@@ -75,9 +80,13 @@ def load_settings():
             print(f"[SET] Warn: {e}")
     return s
 
-def save_settings(hitdelay, hf_cfg: HyperfocusConfig):
+def save_settings(hitdelay, hf_cfg: HyperfocusConfig, wiggle_delay=None, fullblack_delay=None):
     blob = {
         "hitdelay": int(hitdelay),
+        "delays": {
+            "wiggle_9": int(wiggle_delay if wiggle_delay is not None else DEFAULT_SETTINGS["delays"]["wiggle_9"]),
+            "fullblack_7": int(fullblack_delay if fullblack_delay is not None else DEFAULT_SETTINGS["delays"]["fullblack_7"]),
+        },
         "hyperfocus": {
             "enabled": bool(hf_cfg.enabled),
             "slot": int(hf_cfg.slot),
@@ -93,6 +102,27 @@ def save_settings(hitdelay, hf_cfg: HyperfocusConfig):
 
 SET = load_settings()
 g_hit_ante_ms  = int(SET["hitdelay"])
+g_wiggle9_ms   = int(SET["delays"]["wiggle_9"])
+g_fullblk7_ms  = int(SET["delays"]["fullblack_7"])
+
+# ── On-the-fly Toggle Hooks für Collector ────────────────────────────────────
+_RUNTIME_LOCK  = threading.Lock()
+_RUNTIME_HOOKS = {"sc": None, "hf": None}   # werden auf lebende Objekte gesetzt
+_RUNTIME_FLAGS = {"sc": None, "hf": None}   # letzter Wunschzustand (vor Objektlebenszeit möglich)
+
+def _toggle_sc_runtime(enabled: bool):
+    with _RUNTIME_LOCK:
+        _RUNTIME_FLAGS["sc"] = bool(enabled)
+        fn = _RUNTIME_HOOKS.get("sc")
+        if callable(fn):
+            fn(bool(enabled))
+
+def _toggle_hf_runtime(enabled: bool):
+    with _RUNTIME_LOCK:
+        _RUNTIME_FLAGS["hf"] = bool(enabled)
+        fn = _RUNTIME_HOOKS.get("hf")
+        if callable(fn):
+            fn(bool(enabled))
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def _ns_to_ms(ns: int) -> float:
@@ -191,7 +221,8 @@ def monitor(ai_model_path, provider_label, monitor_id,
     _hf_cfg.rois[3] = _parse_roi(hf_roi3, _hf_cfg.rois[3])
     _hf_cfg.rois[4] = _parse_roi(hf_roi4, _hf_cfg.rois[4])
 
-    save_settings(g_hit_ante_ms, _hf_cfg)
+    # Settings inkl. klassenspezifischer Delays persistieren
+    save_settings(g_hit_ante_ms, _hf_cfg, wiggle_delay=wiggle_delay, fullblack_delay=fullblack_delay)
 
     ai_model = AI_model(model_path=ai_model_path, provider=provider, nb_cpu_threads=cpu_threads, monitor_id=monitor_id)
     gr.Info(f"Running on {ai_model.check_provider()}")
@@ -212,6 +243,18 @@ def monitor(ai_model_path, provider_label, monitor_id,
         save_zero_while_active=True
     )
     hf_collector = HyperfocusCollector(enabled=bool(hf_data_collect), base_dir="Hyperfocus Data")
+
+    # Hooks für On-the-fly Toggle registrieren (lebende Objekte)
+    def _set_sc(en: bool): sc_collector.set_enabled(bool(en))
+    def _set_hf(en: bool): hf_collector.set_enabled(bool(en))
+    with _RUNTIME_LOCK:
+        _RUNTIME_HOOKS["sc"] = _set_sc
+        _RUNTIME_HOOKS["hf"] = _set_hf
+        # ggf. zuletzt gewünschte Flags sofort übernehmen
+        if _RUNTIME_FLAGS["sc"] is not None and _RUNTIME_FLAGS["sc"] != sc_collector.enabled:
+            sc_collector.set_enabled(_RUNTIME_FLAGS["sc"])
+        if _RUNTIME_FLAGS["hf"] is not None and _RUNTIME_FLAGS["hf"] != hf_collector.enabled:
+            hf_collector.set_enabled(_RUNTIME_FLAGS["hf"])
 
     # Frame-Tap-Thread: liest JEDES Kamera-Frame und liefert es an Collector + Inferenz
     stop_evt = threading.Event()
@@ -397,6 +440,10 @@ def monitor(ai_model_path, provider_label, monitor_id,
             tap_th.join(timeout=0.2)
         except Exception:
             pass
+        # Hooks wieder freigeben (verhindert Toggle auf stale Objekte)
+        with _RUNTIME_LOCK:
+            if _RUNTIME_HOOKS.get("sc") is _set_sc: _RUNTIME_HOOKS["sc"] = None
+            if _RUNTIME_HOOKS.get("hf") is _set_hf: _RUNTIME_HOOKS["hf"] = None
 
 # ── UI ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
@@ -435,11 +482,14 @@ if __name__ == "__main__":
                 # Data Collection Optionen direkt unter „Monitor“
                 sc_data_collect = gr.Checkbox(value=False, label="Skillcheck Data collection")
                 hf_data_collect = gr.Checkbox(value=False, label="Hyperfocus Data collection")
+                # On-the-fly Toggle → setzt Runtime-Flags/Hooks, kein Reload nötig
+                sc_data_collect.change(fn=lambda en: _toggle_sc_runtime(en), inputs=sc_data_collect, outputs=[])
+                hf_data_collect.change(fn=lambda en: _toggle_hf_runtime(en), inputs=hf_data_collect, outputs=[])
 
                 gr.Markdown("AI Features options")
                 hit_ante = gr.Slider(0, 120, step=1, value=g_hit_ante_ms, label="Ante-frontier hit delay (ms)")
-                wiggle_delay = gr.Slider(0, 50, step=1, value=10, label="Wiggle Hit delay (Klasse 9)")       # NEU
-                fullblack_delay = gr.Slider(0, 50, step=1, value=10, label="Full Black hit delay (Klasse 7)") # NEU
+                wiggle_delay = gr.Slider(0, 50, step=1, value=g_wiggle9_ms,   label="Wiggle Hit delay (Klasse 9)")
+                fullblack_delay = gr.Slider(0, 50, step=1, value=g_fullblk7_ms, label="Full Black hit delay (Klasse 7)")
                 cpu_threads = gr.Radio(label="CPU threads (ONNX)", choices=[1,2,4,8], value=4)
 
                 with gr.Accordion("Hyperfocus (Perk OCR)", open=False):
@@ -488,7 +538,7 @@ if __name__ == "__main__":
             fn=monitor,
             inputs=[ai_model_path, provider_label, monitor_id,
                     sc_data_collect, hf_data_collect,
-                    hit_ante, wiggle_delay, fullblack_delay, cpu_threads,  # NEU
+                    hit_ante, wiggle_delay, fullblack_delay, cpu_threads,
                     hf_enabled, hf_slot, hf_roi1, hf_roi2, hf_roi3, hf_roi4,
                     hf_async, hf_hz, live_roi],
             outputs=[fps, image_visu, probs, latency_df,

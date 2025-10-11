@@ -92,6 +92,27 @@ class SkillcheckCollector:
                 # lieber EIN Bild verlieren als den Echtzeit-Loop zu blockieren
                 pass
 
+    # ── Runtime Toggle ────────────────────────────────────────────────────────
+    def set_enabled(self, enabled: bool):
+        enabled = bool(enabled)
+        if enabled == self.enabled:
+            return
+        if enabled:
+            # aktivieren
+            self.enabled = True
+            _ensure_dir(self.base_dir)
+            if not (self._writer and self._writer.is_alive()):
+                self._writer_stop.clear()
+                self._writer = threading.Thread(target=self._writer_loop, daemon=True)
+                self._writer.start()
+        else:
+            # deaktivieren
+            self.enabled = False
+            with self._lock:
+                if self._active:
+                    self._stop_session()
+            self._graceful_stop()
+
     # ── Session-State ────────────────────────────────────────────────────────
     def _start_session(self):
         self._session_dir = os.path.join(self.base_dir, _timestamp_dir())
@@ -171,6 +192,16 @@ class HyperfocusCollector:
         self.base_dir = base_dir
         self._lock = threading.Lock()
         self._last_hash: Optional[str] = None
+        if self.enabled:
+            for d in range(0, 7):
+                _ensure_dir(os.path.join(self.base_dir, str(d)))
+
+    # ── Runtime Toggle ────────────────────────────────────────────────────────
+    def set_enabled(self, enabled: bool):
+        enabled = bool(enabled)
+        if enabled == self.enabled:
+            return
+        self.enabled = enabled
         if self.enabled:
             for d in range(0, 7):
                 _ensure_dir(os.path.join(self.base_dir, str(d)))
